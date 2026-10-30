@@ -1,0 +1,15 @@
+# Render blueprint for the Beast Steps backend.
+# Deploy: Render dashboard -> New -> Blueprint -> select this repo -> Apply.
+# The service name determines the public URL: https://beast-steps-backend.onrender.com
+services:
+  - type: web
+    name: beast-steps-backend
+    runtime: node
+    plan: free
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && node src/server.mjs
+    envVars:
+      - key: RPC_URL
+        value: https://sepolia.base.org
+      - key: NFT_CONTRACT_ADDRESS
+        value: "0x50e680fDf943083D2d59765ccDa6AF20B1569968"
