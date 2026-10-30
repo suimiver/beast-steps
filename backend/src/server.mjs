@@ -1,11 +1,16 @@
+
 // Beast Steps backend API (plain Node http, no framework).
 //
 // Endpoints:
 //   GET  /config            -> game-config.json (the app fetches numbers from here)
 //   POST /auth/nonce        { address }            -> { nonce, message }
 //   POST /auth/verify       { address, signature } -> { sessionToken, holdings } | 401/403
-//   POST /steps             (Bearer session) { rawSteps } -> accrual batch summary
-//   GET  /points            (Bearer session) -> accrued points, reveal progress, tips
+//   POST /steps             (Bearer session) { date: "YYYY-MM-DD", steps }
+//                           -> { equipped, batch } ; one batch per day, and
+//                              re-submitting the same day overwrites that day,
+//                              so app refreshes never double-count.
+//   GET  /points            (Bearer session) -> { periodPoints, lifetimePoints,
+//                              lifetimeSteps, revealed, unlockedTips, batches }
 //
 // State is in-memory for now (dev stage); sessions/batches move to a real DB
 // before production. NFT ownership is re-checked at sign-in and on each steps
@@ -16,7 +21,8 @@ import { readFileSync } from "node:fs";
 import { verifyHolder } from "./nft-gate.mjs";
 import {
   createAccrualBatch,
-  totalAccruedPoints,
+  accruedPointsAt,
+  effectiveSteps,
   isRevealed,
   unlockedTipCount,
 } from "./points-engine.mjs";
@@ -25,11 +31,17 @@ import { makeVerifySignature, makeCheckOwnership, signInMessage } from "./chain.
 export function createServer({ config, checkOwnership, verifySignature }) {
   const nonces = new Map(); // address -> nonce
   const sessions = new Map(); // token -> { address, holdings }
-  const userState = new Map(); // address -> { batches: [], lifetimeSteps: number }
+  const userState = new Map(); // address -> { days: Map<date, { batch, rawSteps }> }
 
   const stateFor = (address) => {
-    if (!userState.has(address)) userState.set(address, { batches: [], lifetimeSteps: 0 });
+    if (!userState.has(address)) userState.set(address, { days: new Map() });
     return userState.get(address);
+  };
+
+  // "monthly" period -> the batch dates that belong to the current UTC month.
+  const currentPeriodPrefix = (nowMs) => {
+    const d = new Date(nowMs);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
   };
 
   const readBody = (req) =>
@@ -96,18 +108,31 @@ export function createServer({ config, checkOwnership, verifySignature }) {
         // Re-check ownership on every submission: a sold NFT stops accrual.
         const holdings = await checkOwnership(session.address);
         if (!holdings || holdings.length === 0) return send(res, 403, { error: "no_nft" });
-        const { rawSteps } = await readBody(req);
-        if (!Number.isFinite(rawSteps) || rawSteps < 0) return send(res, 400, { error: "rawSteps_required" });
+        const body = await readBody(req);
+        const stepCount = Number.isFinite(body.steps) ? body.steps : body.rawSteps;
+        if (
+          typeof body.date !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(body.date) ||
+          !Number.isFinite(stepCount) ||
+          stepCount < 0
+        ) {
+          return send(res, 400, { error: "date_and_steps_required" });
+        }
         const equipped = holdings[0];
-        const batch = createAccrualBatch(rawSteps, equipped.tier, config, Date.now());
-        const state = stateFor(session.address);
-        state.batches.push(batch);
-        state.lifetimeSteps += rawSteps;
+        const batch = { ...createAccrualBatch(stepCount, equipped.tier, config, Date.now()), date: body.date };
+        // One batch per day: resubmitting the same date replaces it (and its
+        // 24h drip restarts), so repeated app refreshes never double-count.
+        stateFor(session.address).days.set(body.date, { batch, rawSteps: stepCount });
         return send(res, 200, {
           equipped,
-          batchTotalPoints: batch.totalPoints,
-          effectiveSteps: Math.round(batch.totalPoints / config.tiers[equipped.tier].efficiency),
-          accrualEndsAt: batch.endTimeMs,
+          batch: {
+            date: body.date,
+            rawSteps: stepCount,
+            effectiveSteps: effectiveSteps(stepCount, equipped.tier, config),
+            pointsAccrued: batch.totalPoints,
+            startsAt: batch.startTimeMs,
+            endsAt: batch.endTimeMs,
+          },
         });
       }
 
@@ -116,12 +141,34 @@ export function createServer({ config, checkOwnership, verifySignature }) {
         if (!session) return send(res, 401, { error: "unauthorized" });
         const state = stateFor(session.address);
         const now = Date.now();
+        const periodPrefix = currentPeriodPrefix(now);
+        let periodPoints = 0;
+        let lifetimePoints = 0;
+        let lifetimeSteps = 0;
+        const batches = [];
+        for (const [date, { batch, rawSteps }] of [...state.days.entries()].sort()) {
+          const accrued = accruedPointsAt(batch, now);
+          lifetimePoints += accrued;
+          if (date.startsWith(periodPrefix)) periodPoints += accrued;
+          lifetimeSteps += rawSteps;
+          batches.push({
+            date,
+            rawSteps,
+            effectiveSteps: effectiveSteps(rawSteps, batch.tier, config),
+            pointsAccrued: batch.totalPoints,
+            accruedPoints: accrued,
+            startsAt: batch.startTimeMs,
+            endsAt: batch.endTimeMs,
+          });
+        }
         return send(res, 200, {
           address: session.address,
-          accruedPoints: totalAccruedPoints(state.batches, now),
-          lifetimeSteps: state.lifetimeSteps,
-          revealed: isRevealed(state.lifetimeSteps, config),
-          unlockedTips: unlockedTipCount(state.lifetimeSteps, config),
+          periodPoints,
+          lifetimePoints,
+          lifetimeSteps,
+          revealed: isRevealed(lifetimeSteps, config),
+          unlockedTips: unlockedTipCount(lifetimeSteps, config),
+          batches,
         });
       }
 
