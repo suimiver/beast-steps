@@ -1,1 +1,1 @@
-{"dependencies":{"ethers":"^6.17.0","ganache":"^7.9.2","solc":"^0.8.26"},"engines":{"node":">=20"},"name":"beast-steps-backend","private":true,"scripts":{"start":"node src/server.mjs","test":"node --test"},"type":"module","version":"0.2.0"}
+{"dependencies":{"ethers":"^6.17.0","ganache":"^7.9.2","pg":"^8.23.1","solc":"^0.8.26"},"engines":{"node":">=20"},"name":"beast-steps-backend","private":true,"scripts":{"start":"node src/server.mjs","test":"node --test"},"type":"module","version":"0.2.0"}

@@ -1,4 +1,3 @@
-
 // Beast Steps backend API (plain Node http, no framework).
 //
 // Endpoints:
@@ -12,9 +11,11 @@
 //   GET  /points            (Bearer session) -> { periodPoints, lifetimePoints,
 //                              lifetimeSteps, revealed, unlockedTips, batches }
 //
-// State is in-memory for now (dev stage); sessions/batches move to a real DB
-// before production. NFT ownership is re-checked at sign-in and on each steps
-// submission, so selling the NFT cuts off further accrual.
+// State persistence (src/store.mjs): with DATABASE_URL set, nonces, sessions
+// and day batches live in Postgres (Neon) and survive restarts; with DATA_FILE
+// they live in a local JSON file; with neither, state is in-memory only.
+// NFT ownership is re-checked at sign-in and on each steps submission, so
+// selling the NFT cuts off further accrual.
 import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -27,11 +28,18 @@ import {
   unlockedTipCount,
 } from "./points-engine.mjs";
 import { makeVerifySignature, makeCheckOwnership, signInMessage } from "./chain.mjs";
+import { createStoreFromEnv, emptyState } from "./store.mjs";
 
-export function createServer({ config, checkOwnership, verifySignature }) {
-  const nonces = new Map(); // address -> nonce
-  const sessions = new Map(); // token -> { address, holdings }
-  const userState = new Map(); // address -> { days: Map<date, { batch, rawSteps }> }
+export function createServer({ config, checkOwnership, verifySignature, store = null, state = null }) {
+  const { nonces, sessions, userState } = state ?? emptyState();
+  // nonce map: address -> nonce; sessions: token -> { address, holdings };
+  // userState: address -> { days: Map<date, { batch, rawSteps }> }
+
+  // Awaited before answering mutating requests: a completed response means
+  // the new state has been handed to the storage driver (see store.mjs).
+  const persist = async () => {
+    if (store) await store.save({ nonces, sessions, userState });
+  };
 
   const stateFor = (address) => {
     if (!userState.has(address)) userState.set(address, { days: new Map() });
@@ -84,6 +92,7 @@ export function createServer({ config, checkOwnership, verifySignature }) {
         if (!address) return send(res, 400, { error: "address_required" });
         const nonce = randomBytes(16).toString("hex");
         nonces.set(address.toLowerCase(), nonce);
+        await persist();
         return send(res, 200, { nonce, message: signInMessage(address, nonce) });
       }
 
@@ -99,6 +108,7 @@ export function createServer({ config, checkOwnership, verifySignature }) {
         nonces.delete(address.toLowerCase());
         const sessionToken = randomBytes(24).toString("hex");
         sessions.set(sessionToken, { address, holdings: result.holdings });
+        await persist();
         return send(res, 200, { sessionToken, holdings: result.holdings });
       }
 
@@ -123,6 +133,7 @@ export function createServer({ config, checkOwnership, verifySignature }) {
         // One batch per day: resubmitting the same date replaces it (and its
         // 24h drip restarts), so repeated app refreshes never double-count.
         stateFor(session.address).days.set(body.date, { batch, rawSteps: stepCount });
+        await persist();
         return send(res, 200, {
           equipped,
           batch: {
@@ -180,6 +191,8 @@ export function createServer({ config, checkOwnership, verifySignature }) {
 }
 
 // Standalone entry point: `node src/server.mjs`
+// Persistence is chosen from the environment (DATABASE_URL -> Postgres,
+// DATA_FILE -> JSON file, neither -> in-memory); see src/store.mjs.
 if (import.meta.url === `file://${process.argv[1]}`) {
   const config = JSON.parse(readFileSync(new URL("../../config/game-config.json", import.meta.url)));
   const rpcUrl = process.env.RPC_URL || "http://127.0.0.1:8545";
@@ -188,11 +201,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.error("NFT_CONTRACT_ADDRESS env is required");
     process.exit(1);
   }
+  const store = createStoreFromEnv();
+  const state = await store.load();
   const server = createServer({
     config,
     checkOwnership: makeCheckOwnership({ rpcUrl, contractAddress }),
     verifySignature: makeVerifySignature(),
+    store,
+    state,
   });
   const port = Number(process.env.PORT || 8787);
-  server.listen(port, () => console.log(`Beast Steps backend on :${port} (rpc ${rpcUrl}, nft ${contractAddress})`));
+  server.listen(port, () =>
+    console.log(
+      `Beast Steps backend on :${port} (rpc ${rpcUrl}, nft ${contractAddress}, store: ${store.kind})`,
+    ),
+  );
 }

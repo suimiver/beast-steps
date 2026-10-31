@@ -13,3 +13,8 @@ services:
         value: https://sepolia.base.org
       - key: NFT_CONTRACT_ADDRESS
         value: "0x50e680fDf943083D2d59765ccDa6AF20B1569968"
+      # Postgres connection string (Neon). sync: false = Render prompts for
+      # the value at blueprint apply / it is set in the dashboard only.
+      # NEVER commit the real value to this repo.
+      - key: DATABASE_URL
+        sync: false
